@@ -406,7 +406,9 @@ RUNTIME_FILE = SOURCE_OF_TRUTH_FILE
 # pass-rate pattern. The env tier is noisier and costlier, so it replays
 # fewer times under a wider tolerance.
 REGRESS_TOLERANCE_DEFAULT = 0.15        # text-tier pass-rate drop allowed before REGRESSED
-REGRESS_N_TEXT_DEFAULT = 5              # replays per text-tier case (tracks HEAL_N_REPLAYS_DEFAULT)
+# Text-tier replays-per-case reuses HEAL_N_REPLAYS_DEFAULT directly — the gate
+# runs heal's n-replay pass-rate pattern, so there is no separate constant to
+# drift out of sync. Only the env tier gets its own n (slower/costlier).
 REGRESS_N_ENV_DEFAULT = 3              # replays per env-tier case (slower/costlier)
 REGRESS_ENV_TOLERANCE_DEFAULT = 0.20    # env-tier pass-rate drop allowed before REGRESSED
 
@@ -6863,6 +6865,60 @@ async def replay_capture(record: dict, *,
     return (envelope, structured)
 
 
+def _hard_fail_verdict(rationale: str) -> dict:
+    """A deterministic hard-FAIL verdict, decided in code (§12) — used when a
+    replay or the judge produced nothing gradeable."""
+    return {
+        "passed": False,
+        "dimensions": {"schema_ok": False, "factual_ok": False,
+                       "hallucination_ok": False},
+        "rationale": rationale,
+        "suggested_fixes": [],
+    }
+
+
+async def score_replay(record: dict, replay, models: dict[str, str],
+                       efforts: dict[str, str | None], caps: dict,
+                       st: "State") -> dict:
+    """The single scoring primitive shared by the heal loop and the
+    regression gate (DESIGN §14): one replay → one judged verdict.
+
+    `replay` is a zero-arg callable returning the awaitable
+    `(envelope, structured)` pair — `replay_capture` for text-tier,
+    `replay_in_env` for env-tier. §12 hardening lives here, once:
+
+    - a replay that crashed, errored, or returned no output is a
+      deterministic hard FAIL decided in code. The judge is never handed
+      the frozen captured content (which it might score as a pass and
+      mask the regression) — only fresh output is judged.
+    - a judge that raised graded nothing: deterministic hard FAIL, not a
+      counted pass. Broad `except Exception` only, so
+      `asyncio.CancelledError` still propagates and `gather_or_cancel`'s
+      sibling cancellation keeps working.
+
+    A single-run score is one call; an aggregate pass-rate is this
+    primitive summed over a batch (heal's per-sample pass rates,
+    `compare_to_baseline`'s per-call_type totals).
+    """
+    try:
+        envelope, _ = await replay()
+    except Exception:
+        envelope = {}
+    fresh = envelope.get("result")
+    if not fresh or envelope.get("is_error", False):
+        return _hard_fail_verdict(
+            "replay produced no gradeable output "
+            "(crashed, errored, or empty result)")
+    judge_record = dict(record)
+    judge_record["response_content"] = fresh
+    judge_record["parsed_ok"] = True
+    judge_record["success"] = True
+    try:
+        return await judge_capture(judge_record, models, efforts, caps, st)
+    except Exception:
+        return _hard_fail_verdict("judge errored — deterministic hard FAIL")
+
+
 def _load_fixture(corpus_dir: Path, case: dict) -> dict:
     """Load a Tier-2 fixture descriptor for a case: the fixture dir and
     its env.json."""
@@ -7333,23 +7389,12 @@ async def heal_baseline(call_type: str, failing_records: list[dict], n: int,
     baseline: dict = {}
 
     async def _run_one(record: dict, replay_idx: int) -> dict:
-        """Run one replay+judge pair; return verdict dict."""
+        """One replay+judge pair via the shared scoring primitive; the
+        unpatched baseline arm replays the captured prompt verbatim."""
         async with sem:
-            call_id = record["call_id"]
-            # Replay with original system prompt (no patch).
-            try:
-                envelope, _ = await replay_capture(record)
-            except Exception:
-                envelope = {}
-            # Build a synthetic record for the judge using the replayed output.
-            judge_record = dict(record)
-            judge_record["response_content"] = (
-                envelope.get("result") or record.get("response_content", "")
-            )
-            judge_record["parsed_ok"] = not envelope.get("is_error", True)
-            judge_record["success"] = not envelope.get("is_error", True)
-            verdict = await judge_capture(judge_record, models, efforts, caps, st)
-            # Write verdict file.
+            verdict = await score_replay(
+                record, lambda: replay_capture(record),
+                models, efforts, caps, st)
             call_id = record["call_id"]
             verdict_path = verdicts_dir / f"{call_id}-{replay_idx}.json"
             verdict_path.write_text(json.dumps(verdict, indent=2))
@@ -7431,60 +7476,20 @@ async def phase_regress(corpus_dir: Path, out_dir: Path, caps: dict,
         async with sem:
             record = case["record"]
             current_prompt = load_prompt(ct)
-            try:
-                if cfg["tier"] == "env":
-                    fixture = _load_fixture(corpus_dir, case)
-                    envelope, _ = await replay_in_env(
-                        record, fixture, override_system_prompt=current_prompt)
-                else:
-                    envelope, _ = await replay_capture(
-                        record, override_system_prompt=current_prompt)
-            except Exception:
-                envelope = {}
-            # §12: a replay that crashed, errored, or returned no output
-            # produced nothing gradeable. Deciding that is code's job — a
-            # deterministic hard FAIL. Do NOT hand the judge the frozen
-            # known-good content (which it might score as a pass and mask
-            # the regression). Only judge a replay that actually returned
-            # fresh output.
-            fresh = envelope.get("result")
-            if not fresh or envelope.get("is_error", False):
-                verdict = {
-                    "passed": False,
-                    "dimensions": {"schema_ok": False, "factual_ok": False,
-                                   "hallucination_ok": False},
-                    "rationale": "replay produced no gradeable output "
-                                 "(crashed, errored, or empty result)",
-                    "suggested_fixes": [],
-                }
+            # The §12 hardening (crashed replay / errored judge → hard FAIL,
+            # never judge frozen content) lives in score_replay, shared with
+            # the heal loop. `_load_fixture` runs inside the replay thunk so a
+            # missing/corrupt fixture is caught there and hard-FAILs this
+            # replay rather than escaping the per-case isolation.
+            if cfg["tier"] == "env":
+                replay = lambda: replay_in_env(
+                    record, _load_fixture(corpus_dir, case),
+                    override_system_prompt=current_prompt)
             else:
-                # Judge the REPLAYED output, not the frozen one (mirrors
-                # heal_baseline._run_one).
-                judge_record = dict(record)
-                judge_record["response_content"] = fresh
-                judge_record["parsed_ok"] = True
-                judge_record["success"] = True
-                try:
-                    verdict = await judge_capture(judge_record, models,
-                                                  efforts, caps, st)
-                except Exception:
-                    # §12: a judge that crashed (e.g. a WorkerError from 2×
-                    # schema-invalid judge output, or an infra error) graded
-                    # nothing. Deciding that is code's job — a deterministic
-                    # hard FAIL for this replay, NOT a fall-back to judging
-                    # the frozen known-good content (which could mask the
-                    # regression) and NOT a counted pass. Catch broad
-                    # Exception only so asyncio.CancelledError still
-                    # propagates and gather_or_cancel's sibling cancellation
-                    # keeps working.
-                    verdict = {
-                        "passed": False,
-                        "dimensions": {"schema_ok": False,
-                                       "factual_ok": False,
-                                       "hallucination_ok": False},
-                        "rationale": "judge errored — deterministic hard FAIL",
-                        "suggested_fixes": [],
-                    }
+                replay = lambda: replay_capture(
+                    record, override_system_prompt=current_prompt)
+            verdict = await score_replay(record, replay, models, efforts,
+                                         caps, st)
             case_out = out_dir / ct / case["case_id"]
             case_out.mkdir(parents=True, exist_ok=True)
             (case_out / f"verdict-{replay_idx}.json").write_text(
@@ -7507,15 +7512,8 @@ async def phase_regress(corpus_dir: Path, out_dir: Path, caps: dict,
                 case = _load_corpus_case(corpus_dir, ct, cid)
             except (FileNotFoundError, json.JSONDecodeError, ValueError):
                 prefail.setdefault(ct, []).extend(
-                    {
-                        "passed": False,
-                        "dimensions": {"schema_ok": False,
-                                       "factual_ok": False,
-                                       "hallucination_ok": False},
-                        "rationale": "case file missing or corrupt — "
-                                     "deterministic hard FAIL",
-                        "suggested_fixes": [],
-                    }
+                    _hard_fail_verdict("case file missing or corrupt — "
+                                       "deterministic hard FAIL")
                     for _ in range(cfg["n"]))
                 log(f"  regress-{ct}-{cid}: case file missing or corrupt — "
                     f"{cfg['n']} hard FAILs")
@@ -7613,7 +7611,7 @@ async def corpus_capture(run_id: str, corpus_dir: Path, leerie_root: Path,
     manifest["captured_from"].append({"run_id": run_id, "ts": _utc_now_iso()})
     manifest.setdefault("defaults", {
         "tolerance": REGRESS_TOLERANCE_DEFAULT,
-        "n_text": REGRESS_N_TEXT_DEFAULT, "n_env": REGRESS_N_ENV_DEFAULT})
+        "n_text": HEAL_N_REPLAYS_DEFAULT, "n_env": REGRESS_N_ENV_DEFAULT})
 
     by_type: dict[str, list[tuple[str, str]]] = {}
     for rec in records:
@@ -7640,7 +7638,7 @@ async def corpus_capture(run_id: str, corpus_dir: Path, leerie_root: Path,
             "tier": items[0][1], "cases": [],
             "baseline_pass_rate": 0.0,
             "n": REGRESS_N_ENV_DEFAULT if items[0][1] == "env"
-                 else REGRESS_N_TEXT_DEFAULT,
+                 else HEAL_N_REPLAYS_DEFAULT,
             "tolerance": REGRESS_ENV_TOLERANCE_DEFAULT if items[0][1] == "env"
                          else REGRESS_TOLERANCE_DEFAULT,
         })
@@ -7911,20 +7909,14 @@ async def heal_replay_patched(call_type: str, iter_n: int, n: int,
 
     async def _run_one(record: dict, replay_idx: int,
                        patched_prompt: str) -> dict:
+        """One replay+judge pair via the shared scoring primitive; the
+        patched arm replays with the proposed prompt swapped in."""
         async with sem:
-            try:
-                envelope, _ = await replay_capture(
-                    record, override_system_prompt=patched_prompt
-                )
-            except Exception:
-                envelope = {}
-            judge_record = dict(record)
-            judge_record["response_content"] = (
-                envelope.get("result") or record.get("response_content", "")
-            )
-            judge_record["parsed_ok"] = not envelope.get("is_error", True)
-            judge_record["success"] = not envelope.get("is_error", True)
-            verdict = await judge_capture(judge_record, models, efforts, caps, st)
+            verdict = await score_replay(
+                record,
+                lambda: replay_capture(
+                    record, override_system_prompt=patched_prompt),
+                models, efforts, caps, st)
             call_id = record["call_id"]
             verdict_path = verdicts_dir / f"{call_id}-{replay_idx}.json"
             verdict_path.write_text(json.dumps(verdict, indent=2))

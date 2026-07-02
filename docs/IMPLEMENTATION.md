@@ -4731,12 +4731,12 @@ Maps to `DESIGN.md` §14. The gate reuses the NDJSON envelope, `replay_capture`,
 `judge_capture`, and `SCHEMAS["judge"]` unchanged; it adds the corpus format
 and these functions:
 
-Module constants (DEFAULT_CAPS-adjacent), tracking `HEAL_N_REPLAYS_DEFAULT`:
+Module constants (DEFAULT_CAPS-adjacent):
 
 | Constant | Value | Role |
 |---|---|---|
 | `REGRESS_TOLERANCE_DEFAULT` | `0.15` | text-tier pass-rate drop allowed before REGRESSED |
-| `REGRESS_N_TEXT_DEFAULT` | `5` | replays per text-tier case |
+| `HEAL_N_REPLAYS_DEFAULT` | `5` | replays per text-tier case — reused from the heal loop directly; there is no separate regress constant to drift out of sync |
 | `REGRESS_N_ENV_DEFAULT` | `3` | replays per env-tier case (slower/costlier) |
 | `REGRESS_ENV_TOLERANCE_DEFAULT` | `0.20` | env-tier pass-rate drop allowed before REGRESSED |
 
@@ -4747,7 +4747,8 @@ tier. `LEERIE_REGRESS_TOLERANCE` / `--regress-tolerance` is an optional global
 override applied uniformly across call_types.
 
 - `corpus_capture(run_id, corpus_dir, leerie_root, caps, st, models, efforts, *, call_types=None, case_name=None, tier="text", tolerance=None) -> dict` — select `success && parsed_ok` records from `<state-root>/runs/<run-id>/calls.ndjson`, write `cases/<call_type>/<case_id>.json`, snapshot Tier-2 fixtures, then run `phase_regress` once against the current prompts to pin `baseline_pass_rate`, `prompt_sha`, `judge_prompt_sha` into `manifest.json`.
-- `phase_regress(corpus_dir, out_dir, caps, st, models, efforts, tier="all", call_types=None, tolerance=None) -> dict` — per selected case, `n` × replay (Tier 1: `replay_capture(override_system_prompt=load_prompt(ct))`; Tier 2: `replay_in_env(...)`) → `judge_capture`; runs under `asyncio.Semaphore(caps["max_parallel"])`; writes per-replay verdicts + `REPORT.json`; returns `compare_to_baseline(...)`. (Function default is `tier="all"`; the `--regress` CLI verb passes `tier="text"` explicitly to exclude Tier-2 env cases from routine CI gating.)
+- `score_replay(record, replay, models, efforts, caps, st) -> dict` — the single scoring primitive shared by the heal loop (`heal_baseline`, `heal_replay_patched`) and the gate (`phase_regress`): one replay → one judged verdict. `replay` is a zero-arg callable returning the awaitable `(envelope, structured)` pair. The §12 hardening lives here once: a crashed/errored/empty replay is a deterministic hard FAIL decided in code (the judge is never handed the frozen captured content), and a judge raise is likewise a hard FAIL for that replay only (broad `except Exception`, so `CancelledError` still propagates). `_hard_fail_verdict(rationale)` builds the FAIL envelope.
+- `phase_regress(corpus_dir, out_dir, caps, st, models, efforts, tier="all", call_types=None, tolerance=None) -> dict` — per selected case, `n` × `score_replay` (Tier 1 replay thunk: `replay_capture(override_system_prompt=load_prompt(ct))`; Tier 2: `replay_in_env(...)` with `_load_fixture` inside the thunk so a missing fixture hard-FAILs that replay); runs under `asyncio.Semaphore(caps["max_parallel"])`; writes per-replay verdicts + `REPORT.json`; returns `compare_to_baseline(...)`. (Function default is `tier="all"`; the `--regress` CLI verb passes `tier="text"` explicitly to exclude Tier-2 env cases from routine CI gating.)
 - `compare_to_baseline(results, manifest) -> dict` — pure Python. Per `call_type`: `current = passes / (len(cases) * n)`; `REGRESSED` iff `_regressed_below(current, baseline_pass_rate, tolerance)`, i.e. `current < baseline - tolerance - _REGRESS_EPS` (the `1e-9` epsilon keeps the exactly-at-boundary case on the OK side despite float subtraction — `0.8 - 0.20` lands at `0.6000000000000001`). The same `_regressed_below` predicate backs `check_convergence`'s REGRESSED arm with `tolerance=0`, so the two §12 enforcement points cannot drift. `overall = "REGRESSED"` if any per-type verdict is `REGRESSED`. Empty corpus → `OK` with a warning. The §12 enforcement point.
 - `replay_in_env(record, fixture, *, override_system_prompt) -> tuple[dict, dict]` — Tier-2 only: materialise `repo.bundle` into a temp clone + worktree, restore `leerie_dir/`, rewrite the absolute `LEERIE_DIR` path in `user_content`, invoke `claude_p` directly with `_suppress_capture=True`. Worktree is disposable.
 - `_validate_corpus_manifest(data) -> None` — mirrors `_validate_run_json`; raises `ValueError` on invariant violations.

@@ -415,3 +415,68 @@ def test_heal_symbols_importable(leerie):
     assert callable(leerie.heal_baseline)
     assert callable(leerie.heal_apply_patch)
     assert callable(leerie.heal_replay_patched)
+
+
+# ---------------------------------------------------------------------------
+# score_replay: the shared scoring primitive (heal + regress gate, §12)
+# ---------------------------------------------------------------------------
+
+def test_heal_baseline_crashed_replay_is_hard_fail_without_judging(
+        leerie, tmp_path, monkeypatch):
+    """A replay that raises must hard-FAIL in code; the judge must never be
+    handed the frozen captured content (the §12 masking gap the old inline
+    copy had)."""
+    heal_dir = tmp_path / "heal"
+    st = _make_state(leerie, tmp_path / "run")
+    records = _make_failing_records(1)
+
+    async def boom_replay(record, *, override_system_prompt=None, cwd=None):
+        raise RuntimeError("replay crashed")
+
+    monkeypatch.setattr(leerie, "replay_capture", boom_replay)
+
+    judged = []
+
+    async def spy_judge(record, models, efforts, caps, st):
+        judged.append(record)
+        return {"passed": True}
+
+    monkeypatch.setattr(leerie, "judge_capture", spy_judge)
+
+    hs = asyncio.run(leerie.heal_baseline(
+        records[0]["call_type"], records, 2, heal_dir, dict(_CAPS), st,
+        _MODELS, _EFFORTS))
+
+    assert judged == [], "judge must not be consulted for a crashed replay"
+    entry = hs.baseline[records[0]["call_id"]]
+    assert entry["pass_rate"] == 0.0
+    assert all(v["passed"] is False for v in entry["verdicts"])
+    assert all("no gradeable output" in v["rationale"]
+               for v in entry["verdicts"])
+
+
+def test_heal_baseline_judge_raise_isolated_to_replay(
+        leerie, tmp_path, monkeypatch):
+    """A judge raise must hard-FAIL only that replay, not abort the loop
+    through gather_or_cancel (mirrors the REGR-01 fix in phase_regress)."""
+    heal_dir = tmp_path / "heal"
+    st = _make_state(leerie, tmp_path / "run")
+    records = _make_failing_records(1)
+
+    async def ok_replay(record, *, override_system_prompt=None, cwd=None):
+        return (dict(_REPLAY_ENVELOPE), {"categories": ["bug-fixing"]})
+
+    monkeypatch.setattr(leerie, "replay_capture", ok_replay)
+
+    async def boom_judge(record, models, efforts, caps, st):
+        raise RuntimeError("judge crashed")
+
+    monkeypatch.setattr(leerie, "judge_capture", boom_judge)
+
+    hs = asyncio.run(leerie.heal_baseline(
+        records[0]["call_type"], records, 2, heal_dir, dict(_CAPS), st,
+        _MODELS, _EFFORTS))
+
+    entry = hs.baseline[records[0]["call_id"]]
+    assert entry["pass_rate"] == 0.0
+    assert all("judge errored" in v["rationale"] for v in entry["verdicts"])

@@ -30,6 +30,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   names are globally unique; the old `leerie` default silently failed for
   other users). Set via `--fly-app <name>` or `export LEERIE_FLY_APP=<name>`.
 
+### Changed
+
+- **Regression gate folded onto the heal-loop primitives.** One shared
+  `score_replay` primitive (replay → judged verdict, §12 hardening included)
+  now backs `heal_baseline`, `heal_replay_patched`, and `phase_regress` —
+  previously three copy-pasted variants, only one of which had the
+  crashed-replay/errored-judge hard-FAIL guards. The heal loop inherits
+  those guards: a crashed replay is a deterministic hard FAIL (the judge is
+  never handed the frozen captured content), and a judge raise fails only
+  that replay instead of aborting the loop. The separate
+  `REGRESS_N_TEXT_DEFAULT` constant is gone — text-tier replay count reuses
+  `HEAL_N_REPLAYS_DEFAULT` directly.
+
 ### Fixed
 
 - **Regression gate: env tier no longer fabricates the environment for

@@ -89,7 +89,8 @@ def test_corpus_capture_promotes_good_records_and_pins_baseline(
     leerie._validate_corpus_manifest(manifest)
     assert manifest["call_types"]["classifier"]["baseline_pass_rate"] == 0.9
     assert manifest["call_types"]["classifier"]["tier"] == "text"
-    assert manifest["call_types"]["classifier"]["n"] == leerie.REGRESS_N_TEXT_DEFAULT
+    # Text-tier n reuses heal's replay count directly — no parallel constant.
+    assert manifest["call_types"]["classifier"]["n"] == leerie.HEAL_N_REPLAYS_DEFAULT
     assert "prompt_sha" in manifest["call_types"]["classifier"]
     assert manifest["judge_prompt_sha"] == leerie._prompt_sha("judge")
 
@@ -283,7 +284,7 @@ def test_capture_crash_restores_prior_manifest(leerie, tmp_path, monkeypatch):
             "reconciler": {
                 "tier": "text", "cases": ["reconciler-001"],
                 "baseline_pass_rate": 0.9,
-                "n": leerie.REGRESS_N_TEXT_DEFAULT,
+                "n": leerie.HEAL_N_REPLAYS_DEFAULT,
                 "tolerance": leerie.REGRESS_TOLERANCE_DEFAULT,
             }
         },
