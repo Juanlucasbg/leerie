@@ -331,3 +331,78 @@ def test_manifest_write_is_atomic(leerie, tmp_path, monkeypatch):
 
     assert (corpus / "manifest.json").exists()
     assert not (corpus / "manifest.json.tmp").exists()
+
+
+def test_tier_env_capture_measures_all_tiers_no_degenerate_baseline(
+        leerie, tmp_path, monkeypatch):
+    """`--tier env` still writes non-acting records as text-tier cases; the
+    internal pin-time phase_regress must measure them (tier="all"), else their
+    baseline_pass_rate pins at the degenerate 0.0 (un-failable gate)."""
+    leerie_root = tmp_path / "state"
+    _seed_run(leerie_root, "r1")
+    corpus = tmp_path / "corpus"
+
+    seen_tier = {}
+
+    async def fake_phase_regress(corpus_dir, out_dir, caps, st, models,
+                                 efforts, tier="all", call_types=None,
+                                 tolerance=None):
+        seen_tier["tier"] = tier
+        manifest = leerie._load_corpus_manifest(corpus_dir)
+        # Every selected call_type measured a healthy 0.9 (would be 0.0 for any
+        # call_type the tier filter skipped).
+        per = {ct: {"current": 0.9} for ct in manifest["call_types"]}
+        return {"overall": "OK", "per_call_type": per, "warnings": []}
+
+    monkeypatch.setattr(leerie, "phase_regress", fake_phase_regress)
+    st = _MiniState(leerie_root / "runs" / "r1")
+    # Capture only the text-tier classifier under --tier env.
+    asyncio.run(leerie.corpus_capture(
+        "r1", corpus, leerie_root, dict(leerie.DEFAULT_CAPS), st, {}, {},
+        call_types=["classifier"], tier="env"))
+
+    assert seen_tier["tier"] == "all", (
+        "corpus_capture must pin with tier='all', not the capture --tier")
+    manifest = json.loads((corpus / "manifest.json").read_text())
+    # A text-tier case captured under --tier env still gets a real baseline.
+    assert manifest["call_types"]["classifier"]["tier"] == "text"
+    assert manifest["call_types"]["classifier"]["baseline_pass_rate"] == 0.9
+
+
+def test_env_tier_excludes_judgment_workers(leerie, tmp_path, monkeypatch):
+    """integrator/provision are judgment workers (real-repo, read-only), not
+    worktree-acting workers; env-tier reconstruction does not model them, so
+    they must be captured as text-tier and never drive _snapshot_env_fixture."""
+    leerie_root = tmp_path / "state"
+    run_dir = leerie_root / "runs" / "r1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "calls.ndjson").write_text(json.dumps(
+        {"call_id": "id-int-1", "call_type": "integrator", "model": "opus",
+         "system_prompt": "p", "user_content": "u", "response_content": "{}",
+         "parsed_ok": True, "success": True}) + "\n")
+    corpus = tmp_path / "corpus"
+
+    def _boom(*a, **k):
+        raise AssertionError("_snapshot_env_fixture called for a judgment worker")
+
+    monkeypatch.setattr(leerie, "_snapshot_env_fixture", _boom)
+
+    async def fake_phase_regress(corpus_dir, out_dir, caps, st, models,
+                                 efforts, tier="all", call_types=None,
+                                 tolerance=None):
+        manifest = leerie._load_corpus_manifest(corpus_dir)
+        return {"overall": "OK", "warnings": [],
+                "per_call_type": {ct: {"current": 0.9}
+                                  for ct in manifest["call_types"]}}
+
+    monkeypatch.setattr(leerie, "phase_regress", fake_phase_regress)
+    st = _MiniState(leerie_root / "runs" / "r1")
+    asyncio.run(leerie.corpus_capture(
+        "r1", corpus, leerie_root, dict(leerie.DEFAULT_CAPS), st, {}, {},
+        tier="all"))
+
+    case = json.loads(
+        (corpus / "cases" / "integrator" / "integrator-001.json").read_text())
+    assert case["fixture"] is None
+    manifest = json.loads((corpus / "manifest.json").read_text())
+    assert manifest["call_types"]["integrator"]["tier"] == "text"

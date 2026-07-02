@@ -122,6 +122,12 @@ _LAUNCHER_ONLY_BOOLEAN_FLAGS: frozenset[str] = frozenset({
     # records it via update_run_json after host_finalize. The
     # orchestrator never reads it.
     "--chain-id",
+    # --fly-app is value-taking but launcher-only: the LEERIE_FLY_APP
+    # resolver consumes it on the host (Fly app names are globally unique,
+    # so there is no default) before REWRITTEN_ARGS is built. It must be in
+    # _value_flags so the task-extractor does not capture the app name as
+    # the task positional (`./leerie --fly-app my-app "task"`).
+    "--fly-app",
 })
 
 

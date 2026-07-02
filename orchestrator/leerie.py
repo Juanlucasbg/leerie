@@ -413,6 +413,15 @@ REGRESS_ENV_TOLERANCE_DEFAULT = 0.20    # env-tier pass-rate drop allowed before
 REGRESS_TOLERANCE_ENV = "LEERIE_REGRESS_TOLERANCE"
 REGRESS_TOLERANCE_FILE = SOURCE_OF_TRUTH_FILE   # leerie.toml
 
+# Float slack for the single regression predicate (`_regressed_below`). A
+# measured pass-rate is passes/total (e.g. 9/15 = 0.6) while the threshold is
+# baseline - tolerance computed by float subtraction (0.8 - 0.20 can land at
+# 0.6000000000000001). Without slack a run scoring exactly the boundary would
+# spuriously REGRESSED (exit 12). One ULP-scale epsilon keeps the
+# exactly-at-boundary case on the OK side; real pass-rate steps are >= 1/n,
+# many orders of magnitude larger, so this never masks a genuine regression.
+_REGRESS_EPS = 1e-9
+
 CORPUS_TIERS = ("text", "env")
 CORPUS_MANIFEST_VERSION = 1
 
@@ -423,8 +432,13 @@ CORPUS_MANIFEST_VERSION = 1
 CORPUS_DIR_ENV = "LEERIE_CORPUS_DIR"
 
 # Acting workers reconstruct env on replay (Tier 2); everything else is
-# text-tier. (Mirrors the model-default acting/judgment split.)
-ACTING_WORKER_TYPES = ("implementer", "conformer", "integrator", "provision")
+# text-tier. This is exactly the model-default *acting* set — the workers that
+# run autonomously inside an isolated worktree with ACT_TOOLS. integrator and
+# provision are judgment workers (they run read-only in the real repo cwd, not
+# a worktree), so `_snapshot_env_fixture`'s worktree/ACT_TOOLS/autonomous
+# reconstruction does not model them; including them here fabricated a wrong
+# env and produced meaningless env-tier verdicts (env-tier review finding).
+ACTING_WORKER_TYPES = ("implementer", "conformer")
 
 # Confidence-rounds preference — see IMPLEMENTATION.md §2 "Confidence
 # rounds". Resolution order: --confidence-rounds CLI flag →
@@ -7651,8 +7665,14 @@ async def corpus_capture(run_id: str, corpus_dir: Path, leerie_root: Path,
     # freshly-written cases.
     out_dir = st.run_dir / "corpus-capture-out"
     try:
+        # Measure every freshly-written case at its OWN tier (tier="all"), not
+        # the capture --tier. `--tier env` still writes non-acting records as
+        # text-tier cases (case_tier falls back to "text"); measuring with
+        # tier="env" would skip them in phase_regress and pin their
+        # baseline_pass_rate at the degenerate 0.0 (un-failable gate). The
+        # call_types filter already scopes this to just-captured workers.
         report = await phase_regress(corpus_dir, out_dir, caps, st, models,
-                                     efforts, tier=tier,
+                                     efforts, tier="all",
                                      call_types=list(by_type.keys()),
                                      tolerance=tolerance)
     except BaseException:
@@ -8013,7 +8033,8 @@ def check_convergence(state: HealState, config: dict) -> str:
             sum(v["pass_rate"] for v in state.baseline.values()) / len(state.baseline)
             if state.baseline else 0.0
         )
-        if all(entry.get("pass_rate", 0.0) < baseline_rate for entry in history):
+        if all(_regressed_below(entry.get("pass_rate", 0.0), baseline_rate, 0.0)
+               for entry in history):
             return "REGRESSED"
 
     # PLATEAUED: the last plateau_window iterations all changed by less than plateau_delta.
@@ -8025,6 +8046,18 @@ def check_convergence(state: HealState, config: dict) -> str:
             return "PLATEAUED"
 
     return "CONTINUE"
+
+
+def _regressed_below(current: float, baseline: float, tolerance: float) -> bool:
+    """The single regression predicate (DESIGN §12/§14): True when the measured
+    `current` pass-rate falls more than `tolerance` below `baseline`.
+
+    Shared by `compare_to_baseline` (manifest tolerance) and
+    `check_convergence`'s REGRESSED arm (tolerance=0.0) so the two enforcement
+    points cannot drift. The `_REGRESS_EPS` slack keeps the exactly-at-boundary
+    case (`current == baseline - tolerance`) on the OK side despite
+    float-subtraction rounding — see `_REGRESS_EPS`."""
+    return current < baseline - tolerance - _REGRESS_EPS
 
 
 def compare_to_baseline(results: dict[str, list[dict]], manifest: dict) -> dict:
@@ -8054,7 +8087,8 @@ def compare_to_baseline(results: dict[str, list[dict]], manifest: dict) -> dict:
         current = (passes / total) if total > 0 else 0.0
         baseline = cfg["baseline_pass_rate"]
         tolerance = cfg["tolerance"]
-        verdict = "REGRESSED" if current < baseline - tolerance else "OK"
+        verdict = "REGRESSED" if _regressed_below(
+            current, baseline, tolerance) else "OK"
         if verdict == "REGRESSED":
             overall = "REGRESSED"
         per[ct] = {"current": current, "baseline": baseline,
@@ -15719,7 +15753,13 @@ def main() -> None:
                 call_types=args.regress_call_types, tolerance=regress_tol))
             _print_regress_report(report)
             if args.update_baseline:
+                # --update-baseline is an explicit "accept the current
+                # pass-rate as the new baseline" action: re-pin and succeed
+                # even when the run would otherwise REGRESSED. Exiting 12 here
+                # would fail CI on the very command used to re-baseline.
                 _update_baseline(corpus_dir, report)
+                clean_ok = True
+                return
             if report["overall"] == "REGRESSED":
                 log(f"regression detected — artifacts retained at "
                     f"{regress_st.run_dir} (REPORT.json + per-replay verdicts)")

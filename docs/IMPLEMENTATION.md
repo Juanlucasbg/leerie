@@ -4748,7 +4748,7 @@ override applied uniformly across call_types.
 
 - `corpus_capture(run_id, corpus_dir, leerie_root, caps, st, models, efforts, *, call_types=None, case_name=None, tier="text", tolerance=None) -> dict` — select `success && parsed_ok` records from `<state-root>/runs/<run-id>/calls.ndjson`, write `cases/<call_type>/<case_id>.json`, snapshot Tier-2 fixtures, then run `phase_regress` once against the current prompts to pin `baseline_pass_rate`, `prompt_sha`, `judge_prompt_sha` into `manifest.json`.
 - `phase_regress(corpus_dir, out_dir, caps, st, models, efforts, tier="all", call_types=None, tolerance=None) -> dict` — per selected case, `n` × replay (Tier 1: `replay_capture(override_system_prompt=load_prompt(ct))`; Tier 2: `replay_in_env(...)`) → `judge_capture`; runs under `asyncio.Semaphore(caps["max_parallel"])`; writes per-replay verdicts + `REPORT.json`; returns `compare_to_baseline(...)`. (Function default is `tier="all"`; the `--regress` CLI verb passes `tier="text"` explicitly to exclude Tier-2 env cases from routine CI gating.)
-- `compare_to_baseline(results, manifest) -> dict` — pure Python. Per `call_type`: `current = passes / (len(cases) * n)`; `REGRESSED` iff `current < baseline_pass_rate - tolerance`. `overall = "REGRESSED"` if any per-type verdict is `REGRESSED`. Empty corpus → `OK` with a warning. The §12 enforcement point.
+- `compare_to_baseline(results, manifest) -> dict` — pure Python. Per `call_type`: `current = passes / (len(cases) * n)`; `REGRESSED` iff `_regressed_below(current, baseline_pass_rate, tolerance)`, i.e. `current < baseline - tolerance - _REGRESS_EPS` (the `1e-9` epsilon keeps the exactly-at-boundary case on the OK side despite float subtraction — `0.8 - 0.20` lands at `0.6000000000000001`). The same `_regressed_below` predicate backs `check_convergence`'s REGRESSED arm with `tolerance=0`, so the two §12 enforcement points cannot drift. `overall = "REGRESSED"` if any per-type verdict is `REGRESSED`. Empty corpus → `OK` with a warning. The §12 enforcement point.
 - `replay_in_env(record, fixture, *, override_system_prompt) -> tuple[dict, dict]` — Tier-2 only: materialise `repo.bundle` into a temp clone + worktree, restore `leerie_dir/`, rewrite the absolute `LEERIE_DIR` path in `user_content`, invoke `claude_p` directly with `_suppress_capture=True`. Worktree is disposable.
 - `_validate_corpus_manifest(data) -> None` — mirrors `_validate_run_json`; raises `ValueError` on invariant violations.
 
@@ -4771,11 +4771,17 @@ override applied uniformly across call_types.
 }
 ```
 
-**Tier 2 (env / acting workers).** `implementer`, `conformer`, `integrator`,
-and `provision` build `user_content` from on-disk state (`LEERIE_DIR`,
+**Tier 2 (env / acting workers).** `implementer` and `conformer` — the two
+*acting* workers, which run autonomously inside an isolated worktree with
+`ACT_TOOLS` — build `user_content` from on-disk state (`LEERIE_DIR`,
 `subtasks/<sid>.json`, the worktree CWD, BUILD/LINT/TEST commands) and mutate
 a worktree when re-executed, so they cannot replay as pure functions.
-`corpus_capture --tier env` snapshots a fixture per case:
+`integrator` and `provision` are **judgment** workers (read-only tools,
+real-repo cwd, no worktree); `_snapshot_env_fixture`'s worktree / `ACT_TOOLS`
+/ `autonomous` reconstruction does not model them, so they are always captured
+as **text** tier — `ACTING_WORKER_TYPES = ("implementer", "conformer")`, which
+is exactly the model-default acting set. `corpus_capture --tier env` snapshots
+a fixture per env-tier case:
 
 - `repo.bundle` — `git bundle create` of the base repo state the worktree was
   cut from (captured against the small committed throwaway fixture repo so it

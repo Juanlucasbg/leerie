@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Behavioral regression gate / golden corpus** (DESIGN §14): capture a
+  golden corpus of past worker calls (`leerie --corpus-capture <run-id>`),
+  pin a per-`call_type` baseline pass-rate, and replay the corpus through
+  the current `prompts/` to catch prompt regressions (`leerie --regress`,
+  exits `EXIT_REGRESSED=12` on a drop past tolerance). `leerie --corpus-list`
+  prints the manifest; `leerie --regress --update-baseline` re-pins.
+  Tier‑1 (text) replays any worker as a pure function; Tier‑2 (env)
+  reconstructs a worktree to replay the acting workers (implementer,
+  conformer). Optional self-hosted CI gate in `.github/workflows/regress.yml`.
 - **Rootless containerd support** via PR #18: rootless privilege drop,
   cgroup probe, Linux `stat` compatibility, Ruby dev libraries.
 - **`--fly-app` CLI flag** for setting the Fly app name on the command line.
@@ -20,6 +29,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`LEERIE_FLY_APP` is now required when `--runtime fly`** (Fly.io app
   names are globally unique; the old `leerie` default silently failed for
   other users). Set via `--fly-app <name>` or `export LEERIE_FLY_APP=<name>`.
+
+### Fixed
+
+- **Regression gate: env tier no longer fabricates the environment for
+  judgment workers.** `ACTING_WORKER_TYPES` wrongly included `integrator`
+  and `provision` (read-only, real-repo judgment workers); env-tier
+  reconstruction only models the acting workers, so it now targets
+  `("implementer", "conformer")` and judgment workers replay as Tier‑1 text.
+- **Regression gate: no spurious `REGRESSED` at the exact tolerance
+  boundary.** The verdict now routes through a single epsilon-safe
+  `_regressed_below` predicate shared with `check_convergence`, so a
+  measured `0.6` against `baseline 0.8 − tolerance 0.20` (which floats to
+  `0.6000000000000001`) is correctly `OK` rather than exit 12.
+- **`--corpus-capture --tier env` no longer pins a degenerate 0.0 baseline**
+  for text-tier cases captured alongside env cases (measured at `tier="all"`).
+- **`--regress --update-baseline` now exits 0** after re-pinning instead of
+  still returning `EXIT_REGRESSED=12` on the command used to re-baseline.
+- **Launcher: `--fly-app <name>` value is no longer captured as the task
+  positional** (added to the task-extractor's `_value_flags`).
+- **Launcher: the corpus bind-source `mkdir` no longer aborts a run** under
+  `set -e` on a read-only install directory.
 
 ## [0.8.3]
 

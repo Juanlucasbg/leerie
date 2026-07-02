@@ -2078,7 +2078,7 @@ _value_flags=" --run-id --answers --pr-template --max-workers \
 --source-of-truth --runtime --inspect-dir --model --effort \
 --judge-model --heal-model --pr-writer-model --heal-max-rounds \
 --heal-success-threshold --verbosity --telemetry-dir --judge-dir \
---heal-dir --phase --host-no-push --status --chain-id \
+--heal-dir --phase --host-no-push --status --chain-id --fly-app \
 --corpus-capture --tier --call-type --case --regress-tolerance "
 for arg in "$@"; do
   # Skip if this arg is the value of a previous value-taking flag.
@@ -3231,9 +3231,12 @@ for _a in "$@"; do
     --regress|--corpus-capture|--corpus-list) LEERIE_CORPUS_VERB=1 ;;
   esac
 done
-# Ensure the host-side corpus bind source exists before nerdctl mounts it
-# (always safe to mkdir the tool's own corpus dir).
-mkdir -p "$LEERIE_REPO/corpus"
+# Ensure the host-side corpus bind source exists before nerdctl mounts it.
+# Non-fatal under `set -e`: a read-only install dir (root-owned $LEERIE_REPO
+# run as non-root) must not abort an ordinary run that never touches the
+# corpus — nerdctl will surface a clear mount error only if a corpus verb
+# actually needs the writable /corpus mount.
+mkdir -p "$LEERIE_REPO/corpus" 2>/dev/null || true
 container_rc=0
 if [ "$RUNTIME" = "fly" ]; then
   # --- remote execution path (Fly.io Machines) -------------------------

@@ -64,16 +64,37 @@ def test_multi_call_type_one_regresses_one_improves(leerie):
     assert report["per_call_type"]["planner"]["verdict"] == "REGRESSED"
 
 
+def test_env_tier_boundary_float_repr_is_ok(leerie):
+    # 9/15 == 0.6 exactly, but 0.8 - 0.20 == 0.6000000000000001 in IEEE754, so
+    # a naive `current < baseline - tolerance` spuriously REGRESSED (exit 12)
+    # at the exact boundary. The epsilon-guarded predicate keeps it OK.
+    manifest = _manifest(
+        {"implementer": _ct(["i1", "i2", "i3"], 5, 0.8, 0.20, tier="env")})
+    report = leerie.compare_to_baseline(
+        {"implementer": _verdicts(9, 6)}, manifest)
+    assert report["per_call_type"]["implementer"]["current"] == 0.6
+    assert report["overall"] == "OK"
+
+
 def test_regressed_semantics_match_check_convergence(leerie):
-    """Coupling test (mirrors tests/test_retryable_failure.py): the
-    comparator's REGRESSED arm must stay consistent with
-    check_convergence — both emit the literal "REGRESSED", and the
-    comparator must decide with a strict `current < baseline - tolerance`
-    comparison. If either drifts, this fails."""
+    """Coupling test: the comparator and the heal-loop convergence check must
+    decide "below baseline" through the SAME predicate so they cannot drift.
+    Both now route through `_regressed_below` — compare_to_baseline with the
+    manifest tolerance, check_convergence's REGRESSED arm with tolerance 0.
+    Asserts the shared call is present in both AND that the predicate is
+    epsilon-safe at the exact boundary (behavioral, not a source-substring
+    marker)."""
     comp_src = inspect.getsource(leerie.compare_to_baseline)
     conv_src = inspect.getsource(leerie.check_convergence)
-    assert '"REGRESSED"' in comp_src
-    assert '"REGRESSED"' in conv_src
-    assert "- cfg" in comp_src or "- tolerance" in comp_src or \
-        "baseline - " in comp_src, (
-        "compare_to_baseline must subtract tolerance from baseline")
+    assert "_regressed_below(" in comp_src, (
+        "compare_to_baseline must decide via the shared _regressed_below "
+        "predicate")
+    assert "_regressed_below(" in conv_src, (
+        "check_convergence's REGRESSED arm must decide via _regressed_below")
+    # Exactly-at-boundary is OK (not a regression), despite float rounding.
+    assert leerie._regressed_below(0.6, 0.8, 0.20) is False
+    # A genuine drop past tolerance regresses.
+    assert leerie._regressed_below(8 / 15, 0.8, 0.20) is True
+    # tolerance=0 (the convergence arm's usage): strictly-below-baseline only.
+    assert leerie._regressed_below(0.8, 0.8, 0.0) is False
+    assert leerie._regressed_below(0.79, 0.8, 0.0) is True
